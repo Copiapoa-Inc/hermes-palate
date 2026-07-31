@@ -113,6 +113,54 @@ def test_bg_work_blocks_idle_via_background_tasks(monkeypatch):
         loop.close()
 
 
+def test_gateway_lifecycle_task_does_not_block_idle(monkeypatch):
+    """A permanent gateway watcher must not make the runner busy forever."""
+    r = GatewayRunner.__new__(GatewayRunner)
+
+    async def _never():
+        await asyncio.sleep(3600)
+
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(_never())
+        r._background_tasks = {task}
+        r._scale_to_zero_exempt_tasks = {task}
+        monkeypatch.setattr("tools.async_delegation.active_count", lambda: 0)
+
+        assert r._scale_to_zero_has_live_background_work() is False
+    finally:
+        task.cancel()
+        loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+        loop.close()
+
+
+@pytest.mark.asyncio
+async def test_supervised_lifecycle_task_is_classified_as_exempt(monkeypatch):
+    """The supervisor must preserve the explicit lifecycle classification."""
+    r = GatewayRunner.__new__(GatewayRunner)
+    r._running = True
+    r._background_tasks = set()
+    r._scale_to_zero_exempt_tasks = set()
+    monkeypatch.setattr("tools.async_delegation.active_count", lambda: 0)
+
+    async def _wait_forever():
+        await asyncio.Event().wait()
+
+    task = r._spawn_supervised(
+        _wait_forever,
+        "lifecycle_test",
+        blocks_scale_to_zero=False,
+    )
+    await asyncio.sleep(0)
+    try:
+        assert task in r._background_tasks
+        assert task in r._scale_to_zero_exempt_tasks
+        assert r._scale_to_zero_has_live_background_work() is False
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 def test_bg_work_blocks_idle_via_async_delegation(monkeypatch):
     """delegate_task(background=true) lives in tools.async_delegation, not the
     process registry. An active background delegation must block suspend too."""
