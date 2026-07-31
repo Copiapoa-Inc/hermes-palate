@@ -14,6 +14,7 @@ from tools.skills_sync import (
     _discover_bundled_skills,
     _compute_relative_dest,
     _dir_hash,
+    _backfill_optional_provenance,
     sync_skills,
     reset_bundled_skill,
     restore_official_optional_skill,
@@ -986,6 +987,38 @@ class TestSyncSkills:
                 result = sync_skills(quiet=True)
 
         assert result["optional_provenance_backfilled"] == []
+
+    def test_relocated_backfill_indexes_the_active_tree_once(self, tmp_path):
+        """Relocated optional skills must share one active-tree scan."""
+        optional = tmp_path / "optional-skills"
+        skills_dir = tmp_path / "user_skills"
+        for name in ("alpha", "beta"):
+            source = optional / "current" / name
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n")
+
+            active = skills_dir / "legacy" / name
+            active.mkdir(parents=True)
+            (active / "SKILL.md").write_text(f"---\nname: {name}\n---\n# {name}\n")
+
+        original_rglob = Path.rglob
+        active_tree_scans = 0
+
+        def tracking_rglob(path, pattern):
+            nonlocal active_tree_scans
+            if path == skills_dir and pattern == "SKILL.md":
+                active_tree_scans += 1
+            return original_rglob(path, pattern)
+
+        with (
+            patch("tools.skills_sync.SKILLS_DIR", skills_dir),
+            patch("tools.skills_sync._get_optional_dir", return_value=optional),
+            patch.object(Path, "rglob", tracking_rglob),
+        ):
+            backfilled = _backfill_optional_provenance(quiet=True)
+
+        assert backfilled == ["alpha", "beta"]
+        assert active_tree_scans == 1
 
     def test_repair_official_optional_restores_reorganized_skill_with_backup(self, tmp_path):
         bundled = self._setup_bundled(tmp_path)
