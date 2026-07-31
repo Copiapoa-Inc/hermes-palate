@@ -1198,3 +1198,191 @@ async def test_capabilities_advertises_session_model_lock(adapter):
         "method": "POST",
         "path": "/api/sessions/{session_id}/model",
     }
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_by_key_returns_matching_rows(auth_adapter, session_db):
+    """GET /api/sessions?session_key=... resolves a memory scope to its rows."""
+    matching = session_db.create_session("keyed-old", "api_server", session_key="scope-a")
+    session_db.create_session("other-key", "api_server", session_key="scope-b")
+    session_db.create_session("no-key", "api_server")
+
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            "/api/sessions",
+            params={"session_key": "scope-a"},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert resp.status == 200
+        payload = await resp.json()
+
+    assert payload["session_key"] == "scope-a"
+    assert [row["id"] for row in payload["data"]] == [matching]
+    assert payload["data"][0]["session_key"] == "scope-a"
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_by_key_orders_newest_first(auth_adapter, session_db):
+    session_db.create_session("keyed-1", "api_server", session_key="scope-a")
+    session_db.create_session("keyed-2", "api_server", session_key="scope-a")
+    with session_db._lock:
+        session_db._conn.execute("UPDATE sessions SET started_at = 100.0 WHERE id = 'keyed-1'")
+        session_db._conn.execute("UPDATE sessions SET started_at = 200.0 WHERE id = 'keyed-2'")
+        session_db._conn.commit()
+
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            "/api/sessions",
+            params={"session_key": "scope-a"},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        payload = await resp.json()
+
+    assert [row["id"] for row in payload["data"]] == ["keyed-2", "keyed-1"]
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_by_key_requires_api_key(adapter, session_db):
+    """Without API_SERVER_KEY a key-scoped lookup is refused, like the header."""
+    session_db.create_session("keyed", "api_server", session_key="scope-a")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/api/sessions", params={"session_key": "scope-a"})
+        assert resp.status == 403
+        body = await resp.json()
+
+    assert "API key" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_by_key_rejects_oversized_key(auth_adapter):
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            "/api/sessions",
+            params={"session_key": "k" * 257},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_without_key_is_unchanged(adapter, session_db):
+    """The generic listing still works unauthenticated and ignores keys."""
+    session_db.create_session("plain", "api_server", session_key="scope-a")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/api/sessions")
+        assert resp.status == 200
+        payload = await resp.json()
+
+    assert "session_key" not in payload
+    assert [row["id"] for row in payload["data"]] == ["plain"]
+
+
+@pytest.mark.asyncio
+async def test_second_concurrent_session_chat_is_rejected_with_409(adapter, session_db):
+    """A session runs one turn at a time; the overlapping caller gets 409."""
+    import asyncio
+
+    session_id = session_db.create_session("busy-session", "api_server")
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def fake_run(**kwargs):
+        first_started.set()
+        await release_first.wait()
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            first = asyncio.create_task(
+                cli.post(f"/api/sessions/{session_id}/chat", json={"message": "one"})
+            )
+            await first_started.wait()
+
+            second = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "two"})
+            assert second.status == 409
+            body = await second.json()
+            assert body["error"]["code"] == "session_busy"
+
+            release_first.set()
+            first_resp = await first
+            assert first_resp.status == 200
+
+            # The slot is free again once the first turn completes.
+            third = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "three"})
+            assert third.status == 200
+
+
+@pytest.mark.asyncio
+async def test_concurrent_chats_on_different_sessions_both_run(adapter, session_db):
+    import asyncio
+
+    session_a = session_db.create_session("session-a", "api_server")
+    session_b = session_db.create_session("session-b", "api_server")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_run(**kwargs):
+        started.set()
+        await release.wait()
+        return {"final_response": "done", "session_id": kwargs["session_id"]}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            first = asyncio.create_task(
+                cli.post(f"/api/sessions/{session_a}/chat", json={"message": "one"})
+            )
+            await started.wait()
+            second = asyncio.create_task(
+                cli.post(f"/api/sessions/{session_b}/chat", json={"message": "two"})
+            )
+            await asyncio.sleep(0)
+            release.set()
+            resp_a, resp_b = await asyncio.gather(first, second)
+
+    assert resp_a.status == 200
+    assert resp_b.status == 200
+
+
+@pytest.mark.asyncio
+async def test_second_concurrent_session_chat_stream_is_rejected_with_409(adapter, session_db):
+    """The stream handler must hold the slot for the run's whole lifetime,
+    not just until the SSE response starts."""
+    import asyncio
+
+    session_id = session_db.create_session("busy-stream", "api_server")
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def fake_run(**kwargs):
+        first_started.set()
+        await release_first.wait()
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            first = asyncio.create_task(
+                cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "one"})
+            )
+            await first_started.wait()
+
+            second = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream", json={"message": "two"}
+            )
+            assert second.status == 409
+            body = await second.json()
+            assert body["error"]["code"] == "session_busy"
+
+            release_first.set()
+            first_resp = await first
+            assert first_resp.status == 200
+            await first_resp.text()
