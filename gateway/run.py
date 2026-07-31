@@ -3675,6 +3675,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Permanent gateway lifecycle tasks share the background-task registry
+        # for cancellation, but their mere existence is not live user work.
+        # Tasks must be added here explicitly; unknown tasks remain blocking.
+        self._scale_to_zero_exempt_tasks: set = set()
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -4852,10 +4856,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Backgrounded delegate_task / kanban / terminal(background=true) are NOT
         counted by _running_agent_count(), but suspending mid-flight loses them.
-        Checks the runner's own tracked tasks + the process registry's running
-        processes + any pending process-completion watchers.
+        Checks finite runner tasks + the process registry's running processes
+        + any pending process-completion watchers. Permanent gateway lifecycle
+        tasks are classified separately and do not count by existence alone.
         """
-        if any(not t.done() for t in self._background_tasks):
+        exempt_tasks = getattr(self, "_scale_to_zero_exempt_tasks", set())
+        if any(
+            not task.done() and task not in exempt_tasks
+            for task in self._background_tasks
+        ):
             return True
         try:
             from tools.async_delegation import active_count
@@ -8462,6 +8471,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _bg is not None:
                     _bg.add(self._loop_heartbeat_task)
                     self._loop_heartbeat_task.add_done_callback(_bg.discard)
+                _exempt = getattr(self, "_scale_to_zero_exempt_tasks", None)
+                if _exempt is not None:
+                    _exempt.add(self._loop_heartbeat_task)
+                    self._loop_heartbeat_task.add_done_callback(_exempt.discard)
         except Exception:
             logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
 
@@ -8566,18 +8579,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.error("Recovered watcher setup error: %s", e)
 
         # Start background session expiry watcher to finalize expired sessions
-        self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
+        self._spawn_supervised(
+            self._session_expiry_watcher,
+            "session_expiry_watcher",
+            blocks_scale_to_zero=False,
+        )
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
-        self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
+        self._spawn_supervised(
+            self._kanban_notifier_watcher,
+            "kanban_notifier_watcher",
+            blocks_scale_to_zero=False,
+        )
 
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
-        self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
+        self._spawn_supervised(
+            self._kanban_dispatcher_watcher,
+            "kanban_dispatcher_watcher",
+            blocks_scale_to_zero=False,
+        )
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -8592,18 +8617,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._platform_reconnect_watcher()
         )
         self._background_tasks.add(self._reconnect_watcher_task)
+        self._scale_to_zero_exempt_tasks.add(self._reconnect_watcher_task)
+        self._reconnect_watcher_task.add_done_callback(
+            self._background_tasks.discard
+        )
+        self._reconnect_watcher_task.add_done_callback(
+            self._scale_to_zero_exempt_tasks.discard
+        )
 
         # Start background handoff watcher — picks up CLI sessions marked
         # handoff_state='pending' in state.db and re-binds them to the
         # destination platform's home channel, then forges a synthetic user
         # turn so the agent kicks off the new chat.
-        self._spawn_supervised(self._handoff_watcher, "handoff_watcher")
+        self._spawn_supervised(
+            self._handoff_watcher,
+            "handoff_watcher",
+            blocks_scale_to_zero=False,
+        )
 
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each
         # result back into its originating session as a new turn, covering the
         # idle case where the subagent finishes with no agent turn running.
-        self._spawn_supervised(self._async_delegation_watcher, "async_delegation_watcher")
+        self._spawn_supervised(
+            self._async_delegation_watcher,
+            "async_delegation_watcher",
+            blocks_scale_to_zero=False,
+        )
 
         # Start the scale-to-zero idle watcher ONLY when this instance is opted
         # in (the NAS "Labs" HERMES_SCALE_TO_ZERO stamp), messaging is
@@ -8617,7 +8657,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "scale-to-zero: armed (idle timeout %.0fs) — watching for idle",
                     self._scale_to_zero_idle_timeout_seconds(),
                 )
-                self._spawn_supervised(self._scale_to_zero_watcher, "scale_to_zero_watcher")
+                self._spawn_supervised(
+                    self._scale_to_zero_watcher,
+                    "scale_to_zero_watcher",
+                    blocks_scale_to_zero=False,
+                )
             else:
                 # Surface WHY an OPTED-IN instance didn't arm (a non-opted instance
                 # not arming is normal — stay silent there). Without this, a failed
@@ -8632,7 +8676,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # left behind by a prior instantiation (durable-volume restart, NS-570)
         # is ignored via its instantiation epoch; only a current-epoch marker
         # engages drain on the first tick.
-        self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
+        self._spawn_supervised(
+            self._drain_control_watcher,
+            "drain_control_watcher",
+            blocks_scale_to_zero=False,
+        )
 
         logger.info("Press Ctrl+C to stop")
         
@@ -8649,7 +8697,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # handoff for the rest of the process life).
     _SUPERVISED_HEALTHY_SECS = 300
 
-    def _spawn_supervised(self, coro_factory, name, *, restart=True, _attempt=0):
+    def _spawn_supervised(
+        self,
+        coro_factory,
+        name,
+        *,
+        restart=True,
+        blocks_scale_to_zero=True,
+        _attempt=0,
+    ):
         """Launch a long-lived background task with task-level supervision.
 
         Complements upstream's per-iteration inner-loop try/except (which only
@@ -8661,12 +8717,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``self._background_tasks``, logs any crash, and restarts with capped
         exponential backoff up to ``_MAX_SUPERVISED_RESTARTS`` failures in rapid
         succession (each within ``_SUPERVISED_HEALTHY_SECS`` of its restart).
+        ``blocks_scale_to_zero=False`` is only for permanent gateway lifecycle
+        tasks whose existence is not active user work. The conservative default
+        keeps every finite or unclassified task as a dormancy blocker.
         The counter resets after any run that stayed healthy for at least
         ``_SUPERVISED_HEALTHY_SECS`` — so a long-lived daemon that crashes
         occasionally over days is never permanently abandoned.
         """
         if getattr(self, "_background_tasks", None) is None:
             self._background_tasks = set()
+        if getattr(self, "_scale_to_zero_exempt_tasks", None) is None:
+            self._scale_to_zero_exempt_tasks = set()
 
         # Monotonic spawn timestamp captured per spawn: the ``_done`` callback
         # uses it to distinguish a rapid crash-loop from a healthy-run-then-crash.
@@ -8676,9 +8737,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # create_task with a signature that rejects the name kwarg.
         task = asyncio.create_task(coro_factory())
         self._background_tasks.add(task)
+        if not blocks_scale_to_zero:
+            self._scale_to_zero_exempt_tasks.add(task)
 
         def _done(t):
             self._background_tasks.discard(t)
+            self._scale_to_zero_exempt_tasks.discard(t)
             if t.cancelled():
                 return
             exc = t.exception()
@@ -8716,12 +8780,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             coro_factory,
                             name,
                             restart=restart,
+                            blocks_scale_to_zero=blocks_scale_to_zero,
                             _attempt=effective_attempt + 1,
                         )
 
                 respawn_task = asyncio.create_task(_respawn())
                 self._background_tasks.add(respawn_task)
+                if not blocks_scale_to_zero:
+                    self._scale_to_zero_exempt_tasks.add(respawn_task)
                 respawn_task.add_done_callback(self._background_tasks.discard)
+                respawn_task.add_done_callback(
+                    self._scale_to_zero_exempt_tasks.discard
+                )
 
         task.add_done_callback(_done)
         return task
@@ -9177,8 +9247,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._reconnect_watcher_task = asyncio.create_task(
             self._platform_reconnect_watcher()
         )
-        if getattr(self, "_background_tasks", None) is not None:
-            self._background_tasks.add(self._reconnect_watcher_task)
+        background_tasks = getattr(self, "_background_tasks", None)
+        if background_tasks is not None:
+            background_tasks.add(self._reconnect_watcher_task)
+            self._reconnect_watcher_task.add_done_callback(
+                background_tasks.discard
+            )
+        exempt_tasks = getattr(self, "_scale_to_zero_exempt_tasks", None)
+        if exempt_tasks is not None:
+            exempt_tasks.add(self._reconnect_watcher_task)
+        if exempt_tasks is not None:
+            self._reconnect_watcher_task.add_done_callback(exempt_tasks.discard)
 
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.
@@ -9774,6 +9853,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 _task.cancel()
             self._background_tasks.clear()
+            getattr(self, "_scale_to_zero_exempt_tasks", set()).clear()
 
             self.adapters.clear()
             for _session_key in list(self._running_agents):
