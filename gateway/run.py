@@ -23843,6 +23843,19 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+async def _discover_mcp_tools_if_configured() -> None:
+    """Discover MCP tools without importing the MCP runtime for empty configs."""
+    from hermes_cli.mcp_startup import _has_configured_mcp_servers
+
+    if not _has_configured_mcp_servers():
+        return
+
+    from tools.mcp_tool import discover_mcp_tools
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, discover_mcp_tools)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -24283,9 +24296,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # heartbeats (Discord shard, Telegram polling) until it returned.
     # See #16856.
     try:
-        from tools.mcp_tool import discover_mcp_tools
-        _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
+        await _discover_mcp_tools_if_configured()
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 

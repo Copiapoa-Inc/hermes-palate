@@ -5,6 +5,8 @@ crash; these prove the guard that turns it into a clear "restart the gateway"
 message before a model switch can hit it.
 """
 
+import builtins
+
 import pytest
 
 from gateway import code_skew
@@ -17,6 +19,29 @@ def _reset_boot_fingerprint(monkeypatch):
 
 
 class TestDetectCodeSkew:
+    def test_fingerprint_does_not_import_the_full_cli(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        git_dir = tmp_path / ".git"
+        ref = git_dir / "refs" / "heads" / "main"
+        ref.parent.mkdir(parents=True)
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+        ref.write_text("abc1234567890\n")
+        monkeypatch.setattr(code_skew, "_PROJECT_ROOT", tmp_path)
+
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "hermes_cli.main":
+                raise AssertionError("code-skew fingerprint imported full CLI")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+        assert code_skew._fingerprint() == "git:refs/heads/main:abc1234567890"
+
     def test_no_boot_fingerprint_means_no_skew(self, monkeypatch):
         # Nothing recorded (e.g. non-git install) -> never a false positive.
         monkeypatch.setattr(code_skew, "_fingerprint", lambda: "git:refs/heads/main:def456")
