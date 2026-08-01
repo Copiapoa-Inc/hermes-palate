@@ -3983,6 +3983,28 @@ class SessionDB:
                 ),
             )
 
+    def list_sessions_by_key(self, session_key: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return sessions carrying ``session_key``, newest conversation first.
+
+        Uses ``idx_sessions_session_key (session_key, started_at DESC)``. Unlike
+        :meth:`find_latest_gateway_session_for_peer` this applies no
+        recoverability or source filter: callers that own the key want every
+        row it maps to, including ended and empty ones.
+        """
+        if not session_key:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM sessions
+                WHERE session_key = ?
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (session_key, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def find_latest_gateway_session_for_peer(
         self,
         *,
