@@ -214,9 +214,10 @@ try:
     _MCP_AVAILABLE = True
     try:
         from mcp.client.streamable_http import streamablehttp_client
-        _MCP_HTTP_AVAILABLE = True
+        _MCP_LEGACY_HTTP = True
     except ImportError:
-        _MCP_HTTP_AVAILABLE = False
+        streamablehttp_client = None
+        _MCP_LEGACY_HTTP = False
     # Prefer the non-deprecated API (mcp >= 1.24.0); fall back to the
     # deprecated wrapper for older SDK versions.
     try:
@@ -224,6 +225,10 @@ try:
         _MCP_NEW_HTTP = True
     except ImportError:
         _MCP_NEW_HTTP = False
+    # HTTP transport is usable with either client API. mcp 2.0.0 removed the
+    # deprecated streamablehttp_client alias, so gating on the legacy symbol
+    # alone silently parked every HTTP MCP server on mcp >= 2 installs.
+    _MCP_HTTP_AVAILABLE = _MCP_LEGACY_HTTP or _MCP_NEW_HTTP
     try:
         from mcp.types import LATEST_PROTOCOL_VERSION
     except ImportError:
