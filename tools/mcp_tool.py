@@ -4553,11 +4553,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # stops retrying and uses alternative approaches (#10447).
         #
         # Once the cooldown elapses, the breaker transitions to
-        # half-open: we let the *next* call through as a probe. On
-        # success the success-path below resets the breaker; on
-        # failure the error paths below bump the count again, which
-        # re-stamps the open-time via _bump_server_error (re-arming
-        # the cooldown).
+        # half-open: we let the *next* call through as a probe. Any
+        # completed RPC round-trip resets the breaker — including one
+        # whose payload is an application-level tool error, since that
+        # still proves reachability. Only transport-level failures
+        # (exceptions, dead/absent sessions) bump the count again,
+        # which re-stamps the open-time via _bump_server_error
+        # (re-arming the cooldown).
         if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
             opened_at = _server_breaker_opened_at.get(server_name, 0.0)
             age = time.monotonic() - opened_at
@@ -4615,6 +4617,17 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     "error": f"MCP server '{server_name}' is not connected"
                 }, ensure_ascii=False)
 
+        # Set once the RPC round-trip completes, whatever the payload says.
+        # A completed round-trip proves the server is reachable, so it must
+        # never count as an "unreachable" breaker strike — application-level
+        # tool errors (result.isError, e.g. argument-validation 400s) are the
+        # tool-loop guardrail's problem, not the breaker's. Without this
+        # split, three padded-argument 400s opened the breaker and blocked
+        # the corrected fourth call, and the model reported a healthy server
+        # as unreachable to the user (2026-08-05 Palate daily-digest
+        # incident).
+        rpc_round_trip = {"completed": False}
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
@@ -4630,6 +4643,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # The RPC round-trip completed — the session is demonstrably
             # healthy at the transport level (even if the tool itself
             # returned isError). Clear the rapid-drop budget (#62212).
+            rpc_round_trip["completed"] = True
             _mark_proven = getattr(server, "_mark_session_proven", None)
             if _mark_proven is not None:
                 _mark_proven()
@@ -4720,15 +4734,22 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # Breaker accounting is about reachability, not payload success.
+            # A completed round-trip resets the breaker even when the tool
+            # returned an application-level error; only error payloads
+            # produced *before* the round-trip (dead session, failed
+            # reconnect) count as strikes.
+            if rpc_round_trip["completed"]:
+                _reset_server_error(server_name)
+            else:
+                try:
+                    parsed = json.loads(result)
+                    if "error" in parsed:
+                        _bump_server_error(server_name)
+                    else:
+                        _reset_server_error(server_name)
+                except (json.JSONDecodeError, TypeError):
+                    _reset_server_error(server_name)
             return result
         except InterruptedError:
             return _interrupted_call_result()
