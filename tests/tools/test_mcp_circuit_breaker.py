@@ -569,3 +569,107 @@ def test_initial_connect_budget_parks_instead_of_exiting_then_revives(monkeypatc
             run_task.cancel()
 
     asyncio.run(_scenario())
+
+
+def test_tool_level_errors_do_not_trip_breaker(monkeypatch, tmp_path):
+    """A completed RPC round-trip whose payload carries an application-level
+    error (result.isError, e.g. a 400 invalid_request from argument
+    validation) proves the server is reachable. It must never count toward
+    the "unreachable" breaker: three padded-argument 400s must not block a
+    fourth, corrected call (2026-08-05 Palate daily-digest incident, where
+    the false "unreachable" verdict reached the end user).
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_count = {"n": 0}
+
+    async def _call_tool_app_error(*a, **kw):
+        call_count["n"] += 1
+        result = MagicMock()
+        result.isError = True
+        block = MagicMock()
+        block.text = '{"error":"invalid_request","message":"cursor must be a non-empty string or null"}'
+        block.resource = None
+        result.content = [block]
+        result.structuredContent = None
+        return result
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_app_error)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+
+        threshold = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        for i in range(threshold + 1):
+            result = handler({})
+            parsed = json.loads(result)
+            assert "error" in parsed, parsed
+            assert "unreachable" not in parsed["error"].lower(), (
+                f"call {i + 1}: tool-level errors must not open the breaker"
+            )
+
+        assert call_count["n"] == threshold + 1, (
+            "every call must reach the session; none may be short-circuited"
+        )
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0, (
+            "completed round-trips must not accumulate breaker strikes"
+        )
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
+def test_half_open_probe_closes_breaker_on_tool_level_error(monkeypatch, tmp_path):
+    """A half-open probe that completes the RPC round-trip closes the
+    breaker even when the tool payload is an application-level error: the
+    transport is demonstrably healthy, and retry-burn on app errors is the
+    tool-loop guardrail's job, not the breaker's.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_count = {"n": 0}
+
+    async def _call_tool_app_error(*a, **kw):
+        call_count["n"] += 1
+        result = MagicMock()
+        result.isError = True
+        block = MagicMock()
+        block.text = "invalid_request"
+        block.resource = None
+        result.content = [block]
+        result.structuredContent = None
+        return result
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_app_error)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        fake_now = [1000.0]
+
+        def _fake_monotonic():
+            return fake_now[0]
+
+        monkeypatch.setattr(mcp_tool.time, "monotonic", _fake_monotonic)
+        if hasattr(mcp_tool, "_server_breaker_opened_at"):
+            mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
+        cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
+
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+
+        fake_now[0] += cooldown + 1.0
+        result = handler({})
+        parsed = json.loads(result)
+        assert call_count["n"] == 1, "half-open probe should invoke session"
+        assert "unreachable" not in parsed.get("error", "").lower()
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0, (
+            "a completed probe round-trip must close the breaker"
+        )
+    finally:
+        _cleanup(mcp_tool, "srv")
