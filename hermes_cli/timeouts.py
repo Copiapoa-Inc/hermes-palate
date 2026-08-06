@@ -69,6 +69,35 @@ def get_provider_stale_timeout(
     return _coerce_timeout(provider_config.get("stale_timeout_seconds"))
 
 
+def get_provider_stale_budget(
+    provider_id: str, model: str | None = None
+) -> float | None:
+    """Return a configured cumulative stream-stall budget, if any."""
+    if not provider_id:
+        return None
+
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
+    except Exception:
+        return None
+
+    providers = config.get("providers", {}) if isinstance(config, dict) else {}
+    provider_config = (
+        providers.get(provider_id, {}) if isinstance(providers, dict) else {}
+    )
+    if not isinstance(provider_config, dict):
+        return None
+
+    model_config = _get_model_config(provider_config, model)
+    if model_config is not None:
+        budget = _coerce_timeout(model_config.get("stale_budget_seconds"))
+        if budget is not None:
+            return budget
+
+    return _coerce_timeout(provider_config.get("stale_budget_seconds"))
+
+
 def _get_model_config(
     provider_config: dict[str, object], model: str | None
 ) -> dict[str, object] | None:

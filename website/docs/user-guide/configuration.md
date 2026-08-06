@@ -93,6 +93,8 @@ You can set `providers.<id>.request_timeout_seconds` for a provider-wide request
 
 You can also set `providers.<id>.stale_timeout_seconds` for the non-streaming stale-call detector, plus `providers.<id>.models.<model>.stale_timeout_seconds` for a model-specific override. This wins over the legacy `HERMES_API_CALL_STALE_TIMEOUT` env var.
 
+For the shared streaming Chat Completions and Anthropic Messages path, `providers.<id>.stale_budget_seconds` sets the cumulative no-output budget across reconnect attempts. Use `providers.<id>.models.<model>.stale_budget_seconds` for a model-specific override. This wins over `HERMES_STREAM_STALE_BUDGET`. The budget does not apply to AWS Bedrock or the Codex non-streaming wrapper. Those paths keep their per-attempt stale timeouts and the consecutive-stale breaker.
+
 Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERMES_API_CALL_STALE_TIMEOUT=90`s, native Anthropic 900s). The non-streaming stale detector is auto-disabled for local endpoints when left implicit and can scale upward for very large contexts. Not currently wired for AWS Bedrock (both `bedrock_converse` and AnthropicBedrock SDK paths use boto3 with its own timeout configuration). See the commented example in [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example).
 
 ## Update Behavior
@@ -887,6 +889,7 @@ Hermes has separate timeout layers for streaming, plus a stale detector for non-
 |---------|---------|----------------|--------------|
 | Socket read timeout | 120s | Auto-raised to 1800s | `HERMES_STREAM_READ_TIMEOUT` |
 | Stale stream detection | 180s | Auto-disabled | `HERMES_STREAM_STALE_TIMEOUT` |
+| Cumulative shared chat-stream stall budget (not Bedrock or Codex wrapper) | 240s | Never lower than the resolved stale stream timeout | `providers.<id>.stale_budget_seconds` or `HERMES_STREAM_STALE_BUDGET` |
 | Stale non-stream detection | 300s | Auto-disabled when left implicit | `providers.<id>.stale_timeout_seconds` or `HERMES_API_CALL_STALE_TIMEOUT` |
 | API call (non-streaming) | 1800s | Unchanged | `providers.<id>.request_timeout_seconds` / `timeout_seconds` or `HERMES_API_TIMEOUT` |
 

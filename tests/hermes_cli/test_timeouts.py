@@ -4,6 +4,7 @@ import textwrap
 
 from hermes_cli.timeouts import (
     get_provider_request_timeout,
+    get_provider_stale_budget,
     get_provider_stale_timeout,
 )
 
@@ -72,6 +73,24 @@ def test_provider_stale_timeout_used_when_no_model_override(monkeypatch, tmp_pat
     )
 
     assert get_provider_stale_timeout("openai-codex", "gpt-5.4") == 900.0
+
+
+def test_model_stale_budget_override_wins(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          openai-codex:
+            stale_budget_seconds: 300
+            models:
+              gpt-5.4:
+                stale_budget_seconds: 600
+        """,
+    )
+
+    assert get_provider_stale_budget("openai-codex", "gpt-5.4") == 600.0
+    assert get_provider_stale_budget("openai-codex", "gpt-5.5") == 300.0
 
 
 def test_missing_timeout_returns_none(monkeypatch, tmp_path):

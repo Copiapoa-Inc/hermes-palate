@@ -1001,7 +1001,7 @@ class AIAgent:
             except Exception:
                 logger.debug("notice_clear_callback error in _emit_notice_clear", exc_info=True)
 
-    def _emit_wait_notice(self, text: str) -> None:
+    def _emit_wait_notice(self, text: str, *, refresh_activity: bool = True) -> None:
         """Surface a live wait-state explanation on every driver.
 
         Long provider waits (slow/overloaded backend, no first byte, reasoning
@@ -1012,12 +1012,15 @@ class AIAgent:
         - CLI: ``thinking_callback`` updates the prompt_toolkit spinner text.
         - TUI / Desktop: the same callback is bridged to the ``thinking.delta``
           event, which both render as the live spinner/status line.
-        - Gateway: ``_touch_activity`` stores the text as the activity
-          description, which the "⏳ Working — N min" heartbeat includes.
+        - Gateway: the activity description supplies detail for the
+          "⏳ Working — N min" heartbeat.
 
         Never raises — a wait notice must not break the API-call wait loop.
         """
-        self._touch_activity(text)
+        if refresh_activity:
+            self._touch_activity(text)
+        else:
+            self._note_stall_wait(text)
         _thinking_cb = getattr(self, "thinking_callback", None)
         if _thinking_cb:
             try:
@@ -3441,6 +3444,10 @@ class AIAgent:
         """
         self._last_activity_ts = time.time()
         self._last_activity_desc = desc
+        self._heartbeat_kanban_worker()
+
+    def _heartbeat_kanban_worker(self) -> None:
+        """Bridge process liveness to a dispatcher-owned Kanban claim."""
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import heartbeat_current_worker_from_env
@@ -3451,6 +3458,11 @@ class AIAgent:
                 # covers import-time failures (kanban_tools unavailable,
                 # etc.) on niche deployment surfaces.
                 pass
+
+    def _note_stall_wait(self, desc: str) -> None:
+        """Update wait-state detail without refreshing inactivity watchdogs."""
+        self._last_activity_desc = desc
+        self._heartbeat_kanban_worker()
 
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.

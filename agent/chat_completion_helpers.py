@@ -24,9 +24,13 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_request_timeout,
+    get_provider_stale_budget,
+    get_provider_stale_timeout,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
@@ -44,6 +48,8 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+_GATEWAY_INACTIVITY_DEFAULT = 1800.0
+_STREAM_WAIT_NOTICE_INTERVAL = 30.0
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -55,6 +61,113 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+
+
+class _StreamAttemptSnapshot(NamedTuple):
+    attempt_id: int
+    elapsed: float
+    active: bool
+    has_progress: bool
+    completed_stalled: float
+    total_stalled: float
+
+
+class _StreamAttemptTracker:
+    """Keep attempt transitions, progress, and stall accounting under one lock."""
+
+    def __init__(self, *, started_at: Optional[float] = None):
+        self._lock = threading.Lock()
+        self._current = 0
+        self._cancelled: set[int] = set()
+        self._last_progress_at = time.time() if started_at is None else started_at
+        self._has_progress = False
+        self._stalled_total = 0.0
+        self._accounted_attempts: set[int] = set()
+
+    def start_attempt(self, *, now: Optional[float] = None) -> int:
+        started_at = time.time() if now is None else now
+        with self._lock:
+            self._current += 1
+            self._last_progress_at = started_at
+            self._has_progress = False
+            return self._current
+
+    def record_progress(
+        self,
+        attempt_id: int,
+        *,
+        now: Optional[float] = None,
+    ) -> Optional[float]:
+        progress_at = time.time() if now is None else now
+        with self._lock:
+            if attempt_id != self._current or attempt_id in self._cancelled:
+                return None
+            self._last_progress_at = progress_at
+            self._has_progress = True
+            return progress_at
+
+    def snapshot(self, *, now: Optional[float] = None) -> _StreamAttemptSnapshot:
+        observed_at = time.time() if now is None else now
+        with self._lock:
+            elapsed = max(0.0, observed_at - self._last_progress_at)
+            completed = self._stalled_total
+            active = self._current > 0 and self._current not in self._cancelled
+            total = completed
+            if self._current not in self._accounted_attempts:
+                total += elapsed
+            return _StreamAttemptSnapshot(
+                self._current,
+                elapsed,
+                active,
+                self._has_progress,
+                completed,
+                total,
+            )
+
+    def account_stall(
+        self,
+        attempt_id: int,
+        *,
+        now: Optional[float] = None,
+        cancel: bool = False,
+    ) -> Optional[float]:
+        observed_at = time.time() if now is None else now
+        with self._lock:
+            if attempt_id != self._current:
+                return None
+            if attempt_id not in self._accounted_attempts:
+                self._stalled_total += max(
+                    0.0,
+                    observed_at - self._last_progress_at,
+                )
+                self._accounted_attempts.add(attempt_id)
+            if cancel:
+                self._cancelled.add(attempt_id)
+            return self._stalled_total
+
+    def cancel_current(self) -> int:
+        with self._lock:
+            current = self._current
+            if current:
+                self._cancelled.add(current)
+            return current
+
+    def is_active(self, attempt_id: int) -> bool:
+        with self._lock:
+            return attempt_id == self._current and attempt_id not in self._cancelled
+
+    def was_cancelled(self, attempt_id: int) -> bool:
+        with self._lock:
+            return attempt_id in self._cancelled
+
+
+def _initial_wait_refreshes_activity(stale_timeout: Optional[float]) -> bool:
+    """Return whether an unbounded initial wait is declared legitimate."""
+    return (
+        stale_timeout is None
+        or not math.isfinite(stale_timeout)
+        or stale_timeout > _GATEWAY_INACTIVITY_DEFAULT
+    )
 
 
 def _ra():
@@ -258,12 +371,32 @@ def _check_stale_giveup(agent) -> None:
     _giveup = env_int("HERMES_STREAM_STALE_GIVEUP", 5)
     _streak = _stale_streak(agent)
     if _giveup > 0 and _streak >= _giveup:
-        raise RuntimeError(
-            "Provider has been unresponsive (no response received) for "
-            f"{_streak} consecutive stale attempts — aborting this call to "
-            "avoid an indefinite stall. Switch models or start a new "
-            "session, then retry."
-        )
+        raise _stale_giveup_error(agent)
+
+
+def _stale_giveup_error(agent) -> RuntimeError:
+    return RuntimeError(
+        "Provider has been unresponsive (no response received) for "
+        f"{_stale_streak(agent)} consecutive stale attempts — aborting this call to "
+        "avoid an indefinite stall. Switch models or start a new "
+        "session, then retry."
+    )
+
+
+def _derive_stream_stale_budget(
+    stream_stale_timeout: float,
+    *,
+    configured_budget: Optional[float] = None,
+) -> float:
+    """Return the cumulative stalled-time budget for one streaming API call."""
+    budget = (
+        configured_budget
+        if configured_budget is not None
+        else env_float("HERMES_STREAM_STALE_BUDGET", 240.0)
+    )
+    if not math.isfinite(budget) or budget <= 0:
+        budget = 240.0
+    return max(float(stream_stale_timeout), budget)
 
 
 def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
@@ -762,8 +895,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
         t.join(timeout=0.3)
         _poll_count += 1
 
-        # Every ~30s: touch activity for the gateway inactivity monitor AND
-        # rewrite the live spinner/status line so CLI/TUI/Desktop users see
+        # Every ~30s, rewrite the live spinner/status line so users see
         # what the agent is waiting on instead of an unexplained generic
         # spinner (the "infinite thinking" complaint — the wait itself is
         # usually a slow/overloaded provider, but the UI never said so).
@@ -785,7 +917,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 agent._emit_wait_notice(
                     f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
                     f"{int(_elapsed)}s with no response yet (provider may be slow "
-                    f"or overloaded{_recovery})"
+                    f"or overloaded{_recovery})",
+                    refresh_activity=(
+                        getattr(agent, "_codex_stream_last_event_ts", None) is None
+                        and _initial_wait_refreshes_activity(_stale_timeout)
+                    ),
                 )
             except Exception:
                 logger.debug("wait-notice construction failed", exc_info=True)
@@ -834,10 +970,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 pass
             agent._emit_wait_notice(
                 f"⚠ no response from provider in {int(_elapsed)}s — "
-                f"reconnecting..."
-            )
-            agent._touch_activity(
-                f"codex stream killed after {int(_elapsed)}s with no first byte"
+                f"reconnecting...",
+                refresh_activity=False,
             )
             # Wait briefly for the worker to notice the closed connection.
             t.join(timeout=2.0)
@@ -882,7 +1016,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 _close_request_client_once("codex_stream_idle_kill")
             except Exception:
                 pass
-            agent._touch_activity(
+            agent._note_stall_wait(
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
             t.join(timeout=2.0)
@@ -932,7 +1066,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # Circuit breaker (#58962): count the stale kill.  See the
             # canonical comment block above ``_stale_streak()``.
             _bump_stale_streak(agent)
-            agent._touch_activity(
+            agent._note_stall_wait(
                 f"stale non-streaming call killed after {int(_elapsed)}s"
             )
             # Wait briefly for the thread to notice the closed connection.
@@ -2621,10 +2755,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
     first_delta_fired = {"done": False}
     deltas_were_sent = {"yes": False}  # Track if any deltas were fired (for fallback)
-    # Wall-clock timestamp of the last real streaming chunk.  The outer
-    # poll loop uses this to detect stale connections that keep receiving
-    # SSE keep-alive pings but no actual data.
-    last_chunk_time = {"t": time.time()}
     # Stale-stream patience, shared between the httpx socket read timeout
     # (built in ``_call_chat_completions`` below) and the stale-stream detector
     # (computed further down, before the worker thread starts).  Initialized
@@ -2633,24 +2763,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # resolved, so the builder degrades to its plain default if it ever runs
     # first.
     _stream_stale_timeout = None
-    stream_attempt_lock = threading.Lock()
-    stream_attempt_state = {
-        "current": 0,
-        "cancelled": set(),
-        "discarded_chunks": 0,
-        "discarded_bytes": 0,
-    }
+    stream_attempts = _StreamAttemptTracker()
+    stream_discard_lock = threading.Lock()
+    stream_discard_state = {"chunks": 0, "bytes": 0}
 
     def _start_stream_attempt() -> int:
-        with stream_attempt_lock:
-            stream_attempt_state["current"] += 1
-            return int(stream_attempt_state["current"])
+        return stream_attempts.start_attempt()
 
     def _cancel_current_stream_attempt(reason: str) -> None:
-        with stream_attempt_lock:
-            current = int(stream_attempt_state.get("current") or 0)
-            if current:
-                stream_attempt_state["cancelled"].add(current)
+        current = stream_attempts.cancel_current()
         if current:
             logger.debug(
                 "Marked stream attempt %s cancelled: %s",
@@ -2659,26 +2780,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
     def _stream_attempt_is_active(stream_attempt_id: int) -> bool:
-        with stream_attempt_lock:
-            return (
-                stream_attempt_id == int(stream_attempt_state.get("current") or 0)
-                and stream_attempt_id not in stream_attempt_state["cancelled"]
-            )
+        return stream_attempts.is_active(stream_attempt_id)
 
     def _stream_attempt_was_cancelled(stream_attempt_id: int) -> bool:
-        with stream_attempt_lock:
-            return stream_attempt_id in stream_attempt_state["cancelled"]
+        return stream_attempts.was_cancelled(stream_attempt_id)
 
     def _discard_stale_stream_chunk(stream_attempt_id: int, chunk) -> None:
         try:
             chunk_bytes = len(repr(chunk))
         except Exception:
             chunk_bytes = 0
-        with stream_attempt_lock:
-            stream_attempt_state["discarded_chunks"] += 1
-            stream_attempt_state["discarded_bytes"] += chunk_bytes
-            discarded_chunks = stream_attempt_state["discarded_chunks"]
-            discarded_bytes = stream_attempt_state["discarded_bytes"]
+        with stream_discard_lock:
+            stream_discard_state["chunks"] += 1
+            stream_discard_state["bytes"] += chunk_bytes
+            discarded_chunks = stream_discard_state["chunks"]
+            discarded_bytes = stream_discard_state["bytes"]
         if discarded_chunks == 1:
             logger.warning(
                 "Discarding chunk from superseded stream attempt %s "
@@ -2778,16 +2894,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 api_kwargs=stream_kwargs,
             )
         )
-        # Reset stale-stream timer so the detector measures from this
-        # attempt's start, not a previous attempt's last chunk.
-        last_chunk_time["t"] = time.time()
-        agent._touch_activity("waiting for provider response (streaming)")
+        if stream_attempt_id == 1:
+            agent._touch_activity("waiting for provider response (streaming)")
+        else:
+            agent._note_stall_wait("reconnecting to provider stream")
         # Initialize per-attempt stream diagnostics so the retry block can
         # reach for them after the stream dies.  Lives on
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         stream = request_client.chat.completions.create(**stream_kwargs)
+        if not _stream_attempt_is_active(stream_attempt_id):
+            raise _httpx.RemoteProtocolError(
+                f"stream attempt {stream_attempt_id} was superseded"
+            )
         if agent.provider == "moa":
             # The MoA facade is a shared singleton — abort/close of the
             # registered client is a no-op, so register the stream handle
@@ -2882,7 +3002,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     api_kwargs.get("model", "unknown"),
                 )
                 break
-            last_chunk_time["t"] = time.time()
+            _chunk_at = stream_attempts.record_progress(stream_attempt_id)
+            if _chunk_at is None:
+                _discard_stale_stream_chunk(stream_attempt_id, chunk)
+                break
             agent._touch_activity("receiving stream response")
 
             # Update per-attempt diagnostic counters.  Best-effort —
@@ -2891,7 +3014,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             try:
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
-                    _diag["first_chunk_at"] = last_chunk_time["t"]
+                    _diag["first_chunk_at"] = _chunk_at
                 # Approximate byte size from the chunk's repr — exact wire
                 # bytes aren't exposed by the SDK, but len(repr(chunk)) is
                 # a stable proxy for "how much content arrived" that
@@ -2905,10 +3028,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             if agent._interrupt_requested:
                 break
-
-            if not _stream_attempt_is_active(stream_attempt_id):
-                _discard_stale_stream_chunk(stream_attempt_id, chunk)
-                continue
 
             if not chunk.choices:
                 if hasattr(chunk, "model") and chunk.model:
@@ -3175,7 +3294,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             usage=usage_obj,
         )
 
-    def _call_anthropic(request_client):
+    def _call_anthropic(request_client, stream_attempt_id: int):
         """Stream an Anthropic Messages API response.
 
         Fires delta callbacks for real-time token delivery, but returns
@@ -3201,8 +3320,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # fabricated "successful" empty turn.
         saw_stream_event = False
 
-        # Reset stale-stream timer for this attempt
-        last_chunk_time["t"] = time.time()
         # Per-attempt diagnostic dict for the retry block to consume.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
@@ -3240,6 +3357,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         api_kwargs.get("model", "unknown"),
                     )
                     break
+                _event_at = stream_attempts.record_progress(stream_attempt_id)
+                if _event_at is None:
+                    _discard_stale_stream_chunk(stream_attempt_id, event)
+                    break
                 saw_stream_event = True
                 # Update stale-stream timer on every event so the
                 # outer poll loop knows data is flowing.  Without
@@ -3247,14 +3368,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Opus streams after 180 s even when events are
                 # actively arriving (the chat_completions path
                 # already does this at the top of its chunk loop).
-                last_chunk_time["t"] = time.time()
                 agent._touch_activity("receiving stream response")
 
                 # Update per-attempt diagnostic counters (best-effort).
                 try:
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
-                        _diag["first_chunk_at"] = last_chunk_time["t"]
+                        _diag["first_chunk_at"] = _event_at
                     try:
                         _diag["bytes"] = int(_diag.get("bytes", 0)) + len(repr(event))
                     except Exception:
@@ -3301,6 +3421,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # this return value is discarded anyway.
             if agent._interrupt_requested:
                 return None
+            if _stream_attempt_was_cancelled(stream_attempt_id):
+                import httpx as _httpx
+
+                raise _httpx.RemoteProtocolError(
+                    f"stream attempt {stream_attempt_id} was superseded"
+                )
             # Zero-event guard (parity with the chat_completions zero-chunk
             # guard above). Real SDK: an eventless stream has no
             # message_start, so get_final_message() raises AssertionError
@@ -3362,9 +3488,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             ),
                             kind="anthropic_messages",
                         )
-                        result["response"] = _call_anthropic(request_client)
+                        _response = _call_anthropic(
+                            request_client,
+                            stream_attempt_id,
+                        )
                     else:
-                        result["response"] = _call_chat_completions(stream_attempt_id)
+                        _response = _call_chat_completions(stream_attempt_id)
+                    if not _stream_attempt_is_active(stream_attempt_id):
+                        return
+                    result["response"] = _response
                     return  # success
                 except Exception as e:
                     # If the main poll loop force-closed this request because
@@ -3381,6 +3513,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             "cancellation — exiting without retry.",
                             type(e).__name__,
                         )
+                        return
+                    _attempt_stalled_time = stream_attempts.account_stall(
+                        stream_attempt_id,
+                    )
+                    if (
+                        _attempt_stalled_time is not None
+                        and _attempt_stalled_time > _stream_stale_budget
+                    ):
+                        _bump_stale_streak(agent)
+                        result["error"] = _stale_giveup_error(agent)
                         return
                     _is_timeout = isinstance(
                         e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
@@ -3717,26 +3859,29 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
+    # The cumulative budget inherits all context, reasoning, local-provider,
+    # and explicit stale-timeout floors so the first kill still occurs at the
+    # per-attempt timeout. The five-kill breaker remains a secondary cap.
+    _stream_stale_budget = _derive_stream_stale_budget(
+        _stream_stale_timeout,
+        configured_budget=get_provider_stale_budget(agent.provider, agent.model),
+    )
+
     t = threading.Thread(target=_call, daemon=True)
     t.start()
     _last_heartbeat = time.time()
-    _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
     while t.is_alive():
         t.join(timeout=0.3)
 
-        # Periodic heartbeat: touch the agent's activity tracker so the
-        # gateway's inactivity monitor knows we're alive while waiting
-        # for stream chunks.  Without this, long thinking pauses (e.g.
-        # reasoning models) or slow prefill on local providers (Ollama)
-        # trigger false inactivity timeouts.  The _call thread touches
-        # activity on each chunk, but the gap between API call start
-        # and first chunk can exceed the gateway timeout — especially
-        # when the stale-stream timeout is disabled (local providers).
+        # Periodic wait notice for slow prefill and long thinking pauses.
+        # This is status only; it must not make a silent provider look active.
         _hb_now = time.time()
-        if _hb_now - _last_heartbeat >= _HEARTBEAT_INTERVAL:
+        _attempt_snapshot = stream_attempts.snapshot(now=_hb_now)
+        if _hb_now - _last_heartbeat >= _STREAM_WAIT_NOTICE_INTERVAL:
             _last_heartbeat = _hb_now
-            _waiting_secs = int(_hb_now - last_chunk_time["t"])
-            if _waiting_secs >= _HEARTBEAT_INTERVAL:
+            _waiting_elapsed = _attempt_snapshot.elapsed
+            _waiting_secs = int(_waiting_elapsed)
+            if _waiting_elapsed >= _STREAM_WAIT_NOTICE_INTERVAL:
                 # No chunks for 30s+ — rewrite the live spinner/status line
                 # so CLI/TUI/Desktop users see WHAT the wait is (slow or
                 # overloaded provider / long thinking pause) instead of an
@@ -3751,20 +3896,67 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 agent._emit_wait_notice(
                     f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
                     f"{_waiting_secs}s with no output yet (provider may be "
-                    f"slow or overloaded, or the model is thinking{_recovery})"
+                    f"slow or overloaded, or the model is thinking{_recovery})",
+                    refresh_activity=(
+                        _attempt_snapshot.attempt_id == 1
+                        and not _attempt_snapshot.has_progress
+                        and _initial_wait_refreshes_activity(
+                            _stream_stale_timeout
+                        )
+                    ),
                 )
-            else:
-                # Chunks are flowing — keep the activity tracker fresh but
-                # leave the live display alone.
-                agent._touch_activity(
-                    f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
-                )
-
         # Detect stale streams: connections kept alive by SSE pings
         # but delivering no real chunks.  Kill the client so the
         # inner retry loop can start a fresh connection.
-        _stale_elapsed = time.time() - last_chunk_time["t"]
-        if _stale_elapsed > _stream_stale_timeout:
+        _stale_now = time.time()
+        _attempt_snapshot = stream_attempts.snapshot(now=_stale_now)
+        _stale_elapsed = _attempt_snapshot.elapsed
+        _completed_stalled_time = _attempt_snapshot.completed_stalled
+        _total_stalled_time = _attempt_snapshot.total_stalled
+        if (
+            _attempt_snapshot.active
+            and _completed_stalled_time > 0
+            and _total_stalled_time > _stream_stale_budget
+        ):
+            logger.warning(
+                "Stream cumulative stall budget exhausted after %.0fs "
+                "(budget %.0fs). model=%s. Aborting call.",
+                _total_stalled_time,
+                _stream_stale_budget,
+                api_kwargs.get("model", "unknown"),
+            )
+            agent._buffer_status(
+                f"⚠️ Provider produced no output for a cumulative "
+                f"{int(_total_stalled_time)}s. Aborting stalled call."
+            )
+            _request_cancelled["value"] = True
+            stream_attempts.cancel_current()
+            _bump_stale_streak(agent)
+            result["error"] = _stale_giveup_error(agent)
+            try:
+                _close_request_client_once("stale_stream_budget")
+            except Exception:
+                pass
+            agent._emit_wait_notice(
+                f"⚠ provider stalled for a cumulative "
+                f"{int(_total_stalled_time)}s — aborting...",
+                refresh_activity=False,
+            )
+            t.join(timeout=2.0)
+            break
+        if (
+            _attempt_snapshot.active
+            and _stale_elapsed > _stream_stale_timeout
+        ):
+            _stale_attempt_id = _attempt_snapshot.attempt_id
+            _accumulated_stalled_time = stream_attempts.account_stall(
+                _stale_attempt_id,
+                now=_stale_now,
+                cancel=True,
+            )
+            if _accumulated_stalled_time is None:
+                continue
+            _budget_exhausted = _accumulated_stalled_time > _stream_stale_budget
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
@@ -3778,14 +3970,26 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 f"context: ~{_est_ctx:,} tokens). "
                 f"Reconnecting..."
             )
+            if _budget_exhausted:
+                _request_cancelled["value"] = True
+                _bump_stale_streak(agent)
+                result["error"] = _stale_giveup_error(agent)
             try:
-                _cancel_current_stream_attempt("stale_stream_kill")
                 _close_request_client_once("stale_stream_kill")
             except Exception:
                 pass
             # Circuit breaker (#58962): count the stale kill.  See the
             # canonical comment block above ``_stale_streak()``.
-            _bump_stale_streak(agent)
+            if not _budget_exhausted:
+                _bump_stale_streak(agent)
+            if _budget_exhausted:
+                agent._emit_wait_notice(
+                    f"⚠ provider stalled for a cumulative "
+                    f"{int(_accumulated_stalled_time)}s — aborting...",
+                    refresh_activity=False,
+                )
+                t.join(timeout=2.0)
+                break
             # Rebuild the primary client too — its connection pool
             # may hold dead sockets from the same provider outage.
             if agent.api_mode == "anthropic_messages":
@@ -3807,15 +4011,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # The shared client will be replaced lazily by
                 # _ensure_primary_openai_client on the next request.
                 pass
-            # Reset the timer so we don't kill repeatedly while
-            # the inner thread processes the closure.
-            last_chunk_time["t"] = time.time()
             agent._emit_wait_notice(
                 f"⚠ no output from provider for {int(_stale_elapsed)}s — "
-                f"reconnecting..."
-            )
-            agent._touch_activity(
-                f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
+                f"reconnecting...",
+                refresh_activity=False,
             )
 
         if agent._interrupt_requested:

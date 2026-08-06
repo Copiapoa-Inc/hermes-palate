@@ -262,7 +262,7 @@ def emit_stream_drop(
             f"⚠️ {provider} stream {kind} ({type(error).__name__}){_suffix} "
             f"— reconnecting, retry {attempt}/{max_attempts}"
         )
-        agent._touch_activity(
+        agent._note_stall_wait(
             f"stream retry {attempt}/{max_attempts} "
             f"after {type(error).__name__}"
         )

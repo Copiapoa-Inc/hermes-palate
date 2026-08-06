@@ -14,6 +14,7 @@ import sys
 import time
 import types
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -73,6 +74,50 @@ def test_emit_wait_notice_swallows_callback_errors(tmp_path, monkeypatch):
 
     agent._emit_wait_notice("⏳ waiting")  # must not raise
     assert "waiting" in agent.get_activity_summary()["last_activity_desc"]
+
+
+def test_stall_wait_notice_preserves_idle_clock_and_real_progress_refreshes_it(
+    tmp_path, monkeypatch
+):
+    """Stall notices stay visible without making a wedged provider look active."""
+    seen: list[str] = []
+    agent = _make_agent(tmp_path, monkeypatch, thinking_callback=seen.append)
+    agent._last_activity_ts = time.time() - 60.0
+
+    agent._emit_wait_notice(
+        "⏳ waiting on test-model — 60s with no output yet",
+        refresh_activity=False,
+    )
+
+    stalled = agent.get_activity_summary()
+    assert stalled["seconds_since_activity"] >= 59.0
+    assert "waiting on test-model" in stalled["last_activity_desc"]
+    assert seen == ["⏳ waiting on test-model — 60s with no output yet"]
+
+    agent._touch_activity("receiving stream response")
+    assert agent.get_activity_summary()["seconds_since_activity"] < 1.0
+
+
+def test_stall_wait_preserves_idle_clock_and_sends_kanban_heartbeat(
+    tmp_path, monkeypatch
+):
+    import tools.kanban_tools as kanban_tools
+
+    heartbeat = MagicMock()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1290")
+    monkeypatch.setattr(
+        kanban_tools,
+        "heartbeat_current_worker_from_env",
+        heartbeat,
+    )
+    agent = _make_agent(tmp_path, monkeypatch)
+    heartbeat.reset_mock()
+    agent._last_activity_ts = time.time() - 60.0
+
+    agent._note_stall_wait("waiting on stalled provider")
+
+    assert agent.get_activity_summary()["seconds_since_activity"] >= 59.0
+    heartbeat.assert_called_once_with()
 
 
 def test_nonstream_wait_loop_emits_explained_notice(tmp_path, monkeypatch):

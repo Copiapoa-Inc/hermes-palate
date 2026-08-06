@@ -2348,11 +2348,11 @@ def run_conversation(
                                 "interrupted": True,
                             }
                         time.sleep(0.2)
-                        # Touch activity every ~30s so the gateway's inactivity
-                        # monitor knows we're alive during backoff waits.
+                        # Keep wait-state detail current without making retry
+                        # sleep count as agent progress.
                         _backoff_touch_counter += 1
                         if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
-                            agent._touch_activity(
+                            agent._note_stall_wait(
                                 f"retry backoff ({retry_count}/{max_retries}), "
                                 f"{int(sleep_end - time.time())}s remaining"
                             )
@@ -5080,11 +5080,11 @@ def run_conversation(
                             "interrupted": True,
                         }
                     time.sleep(0.2)  # Check interrupt every 200ms
-                    # Touch activity every ~30s so the gateway's inactivity
-                    # monitor knows we're alive during backoff waits.
+                    # Keep wait-state detail current without making retry
+                    # sleep count as agent progress.
                     _backoff_touch_counter += 1
                     if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
-                        agent._touch_activity(
+                        agent._note_stall_wait(
                             f"error retry backoff ({retry_count}/{max_retries}), "
                             f"{int(sleep_end - time.time())}s remaining"
                         )
