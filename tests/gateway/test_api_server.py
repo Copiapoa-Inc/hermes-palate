@@ -988,7 +988,8 @@ class TestHealthDetailedEndpoint:
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
-        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"), \
+             patch("gateway.readiness._probe_disk", return_value={"status": "ok"}):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
@@ -1078,6 +1079,10 @@ class TestHealthDetailedEndpoint:
             "done": {"status": "completed"},
             "failed": {"status": "failed"},
         }
+        adapter._active_run_tasks = {
+            run_id: MagicMock(done=MagicMock(return_value=False))
+            for run_id in ("queued", "running", "approval")
+        }
         # Completed streams may remain attached for replay; they are not work.
         adapter._run_streams = {"done": object(), "failed": object()}
 
@@ -1100,10 +1105,25 @@ class TestHealthDetailedEndpoint:
             "done": {"status": "completed"},
             "cancelled": {"status": "cancelled"},
         }
+        adapter._active_run_tasks = {
+            run_id: MagicMock(done=MagicMock(return_value=False))
+            for run_id in ("queued", "running", "approval", "stopping")
+        }
 
         with patch("tools.process_registry.process_registry.completion_queue.qsize", return_value=0), \
              patch("tools.async_delegation.active_count", return_value=0):
             assert adapter._readiness_work_counts() == (4, 0, 0)
+
+    def test_readiness_work_counts_ignore_stale_nonterminal_status(self, adapter):
+        """A retained label is not active work after its task has settled."""
+        adapter._run_statuses = {
+            "stale": {"status": "running"},
+        }
+        adapter._active_run_tasks = {}
+
+        with patch("tools.process_registry.process_registry.completion_queue.qsize", return_value=0), \
+             patch("tools.async_delegation.active_count", return_value=0):
+            assert adapter._readiness_work_counts() == (0, 0, 0)
 
 
 # ---------------------------------------------------------------------------

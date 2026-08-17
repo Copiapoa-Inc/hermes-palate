@@ -1336,17 +1336,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _readiness_work_counts(self) -> tuple[int, int, int]:
         """Return bounded work counts from each subsystem's public state."""
-        active_api_runs = sum(
-            1
-            for status in self._run_statuses.values()
-            # "stopping" (set by _handle_stop_run) is not terminal: the run
-            # stays in this state, doing real executor-thread work, until the
-            # agent actually notices the interrupt and the task settles to
-            # "cancelled" — an unbounded window, not the old ~5s hard-timeout
-            # wait. Excluding it here undercounts active_api_runs for the
-            # whole duration of a cooperative stop.
-            if status.get("status") in {"queued", "running", "waiting_for_approval", "stopping"}
-        )
+        # Live task ownership is the source of truth for active work. Pollable
+        # status records outlive their tasks, and a task that settles before
+        # its terminal status write must not leave health permanently busy.
+        active_api_runs = self.active_agent_work_count()
         process_depth = 0
         active_delegations = 0
         try:
